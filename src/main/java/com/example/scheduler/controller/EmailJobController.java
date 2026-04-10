@@ -17,8 +17,8 @@ public class EmailJobController {
     private EmailJobService emailJobService;
 
     @PostMapping
-    public EmailJob createJob(@Valid @RequestBody EmailJobRequest request){
-        return emailJobService.createJob(request);
+    public void createJob(@Valid @RequestBody EmailJobRequest request){
+        emailJobService.createJob(request);
     }
 
     @GetMapping
