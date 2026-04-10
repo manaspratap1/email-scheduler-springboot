@@ -1,15 +1,56 @@
 # Email Scheduler
 
-Spring Boot application for scheduling emails, storing jobs in PostgreSQL, and processing them in the background with a polling scheduler.
+Spring Boot application for asynchronous email processing using RabbitMQ, PostgreSQL, and Spring Mail. Email requests are published as messages, processed by a consumer, and failed messages are routed to a dead-letter queue.
 
 ## What It Does
 
-- Accepts email jobs through `POST /emails`
-- Stores jobs in PostgreSQL with status `PENDING`
-- Polls the database every 5 seconds for due jobs
-- Sends emails using Spring Mail
-- Retries failed jobs up to 3 times
-- Marks jobs as `SENT` or `FAILED`
+- Accepts email requests through `POST /emails`
+- Publishes email payloads to RabbitMQ
+- Consumes messages from a RabbitMQ queue
+- Sends emails through Spring Mail
+- Retries failed listener executions
+- Routes exhausted failures to a dead-letter queue
+- Persists failed jobs in PostgreSQL from the DLQ consumer
+
+## Architecture
+
+This version is event-driven.
+
+High-level flow:
+
+1. Client sends `POST /emails`
+2. Controller validates the request body
+3. Service builds an `EmailMessage`
+4. Service publishes the message to RabbitMQ exchange `email_exchange`
+5. RabbitMQ routes it to `email_queue`
+6. `EmailConsumer` listens on `email_queue`
+7. Consumer tries to send the email
+8. If sending fails, the listener throws an exception
+9. RabbitMQ listener retries are attempted
+10. If retries are exhausted, the message is dead-lettered to `email_dlq`
+11. `EmailDLQConsumer` listens on `email_dlq` and stores the failed job in PostgreSQL with status `FAILED`
+
+This is different from the earlier polling model:
+
+- there is no active database polling loop driving delivery
+- job processing is triggered by message arrival
+- RabbitMQ is now the transport layer between producer and consumer
+
+## RabbitMQ Topology
+
+Configured in `RabbitMQConfig`:
+
+- Main exchange: `email_exchange`
+- Main queue: `email_queue`
+- Routing key: `email_routing`
+- Dead-letter exchange: `email_dlx`
+- Dead-letter queue: `email_dlq`
+
+The main queue is configured with a dead-letter exchange:
+
+- `x-dead-letter-exchange = email_dlx`
+
+When a message cannot be processed successfully after retries, RabbitMQ moves it to the dead-letter exchange, and then it is routed to the dead-letter queue.
 
 ## Tech Stack
 
@@ -17,76 +58,68 @@ Spring Boot application for scheduling emails, storing jobs in PostgreSQL, and p
 - Spring Boot
 - Spring Web
 - Spring Data JPA
+- Spring AMQP
+- RabbitMQ
 - PostgreSQL
 - Spring Mail
 - Bean Validation
 - Lombok
 - MailHog for local email testing
 
-## Flow
-
-1. Client sends `POST /emails`
-2. Request is validated
-3. Job is saved in `email_jobs`
-4. Scheduler checks every 5 seconds for due `PENDING` jobs
-5. Email is sent through configured SMTP server
-6. Job status is updated to `SENT` or `FAILED`
-
-This project uses a polling-based background worker. It is not event-driven.
-
 ## Project Structure
 
 ```text
 src/main/java/com/example/scheduler
-|-- controller        # REST endpoints
-|-- dto               # Request payloads
-|-- entity            # JPA entities and enums
-|-- repository        # Database access
-|-- scheduler         # Background polling job
-|-- service           # Business logic and mail sending
+|-- config           # RabbitMQ exchanges, queues, bindings, and message converter
+|-- consumer         # Main queue and DLQ listeners
+|-- controller       # REST endpoints
+|-- dto              # API request DTO and RabbitMQ message payload
+|-- entity           # JPA entity and status enum
+|-- repository       # Database access
+|-- service          # Message publishing and email sending
+|-- scheduler        # Legacy polling-based scheduler from the old design
 ```
 
 ## Configuration
 
-Secrets should not be committed to Git. This project now reads sensitive values from environment variables.
+Secrets should not be committed to Git. The project loads local secrets from `application-secrets.properties` and uses externalized values for database and mail credentials.
 
-`src/main/resources/application.properties` uses placeholders like:
+Example local secret values:
 
 ```properties
-spring.datasource.password=${DB_PASSWORD:}
-spring.mail.username=${MAIL_USERNAME:}
-spring.mail.password=${MAIL_PASSWORD:}
+DB_URL=jdbc:postgresql://localhost:5432/emaildb
+DB_USERNAME=postgres
+DB_PASSWORD=your_db_password
+
+MAIL_HOST=localhost
+MAIL_PORT=1025
+MAIL_USERNAME=
+MAIL_PASSWORD=
+MAIL_SMTP_AUTH=false
+MAIL_SMTP_STARTTLS=false
 ```
 
-You can provide values in any of these ways:
+Current RabbitMQ configuration:
 
-1. Environment variables
-2. Run configuration variables in IntelliJ
-3. Command-line `-D` / `--` properties
-4. A local untracked Spring config file such as `application-local.properties`
-
-### Recommended Environment Variables
-
-```powershell
-$env:DB_URL="jdbc:postgresql://localhost:5432/emaildb"
-$env:DB_USERNAME="postgres"
-$env:DB_PASSWORD="your_db_password"
-$env:MAIL_HOST="localhost"
-$env:MAIL_PORT="1025"
-$env:MAIL_USERNAME=""
-$env:MAIL_PASSWORD=""
+```properties
+spring.rabbitmq.host=localhost
+spring.rabbitmq.port=5672
+spring.rabbitmq.username=guest
+spring.rabbitmq.password=guest
+spring.rabbitmq.listener.simple.retry.enabled=true
+spring.rabbitmq.listener.simple.retry.max-attempts=3
+spring.rabbitmq.listener.simple.retry.initial-interval=1000
+spring.rabbitmq.listener.simple.retry.multiplier=2.0
+spring.rabbitmq.listener.simple.retry.max-interval=5000
 ```
 
-For a real SMTP server you would typically set:
+Retry behavior:
 
-```powershell
-$env:MAIL_HOST="smtp.gmail.com"
-$env:MAIL_PORT="587"
-$env:MAIL_USERNAME="your_email"
-$env:MAIL_PASSWORD="your_app_password"
-$env:MAIL_SMTP_AUTH="true"
-$env:MAIL_SMTP_STARTTLS="true"
-```
+- listener retry is enabled
+- max attempts is `3`
+- first retry delay is `1 second`
+- delay multiplies by `2.0`
+- max delay is `5 seconds`
 
 ## Local Setup
 
@@ -94,7 +127,22 @@ $env:MAIL_SMTP_STARTTLS="true"
 
 Create a database named `emaildb`.
 
-### 2. Start MailHog
+### 2. Start RabbitMQ
+
+```bash
+docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+```
+
+RabbitMQ management UI:
+
+`http://localhost:15672`
+
+Default credentials:
+
+- username: `guest`
+- password: `guest`
+
+### 3. Start MailHog
 
 ```bash
 docker run -d -p 1025:1025 -p 8025:8025 mailhog/mailhog
@@ -104,7 +152,7 @@ MailHog UI:
 
 `http://localhost:8025`
 
-### 3. Run the application
+### 4. Run the application
 
 ```bash
 ./mvnw spring-boot:run
@@ -116,64 +164,93 @@ On Windows PowerShell:
 .\mvnw.cmd spring-boot:run
 ```
 
-Default application port:
+Application URL:
 
 `http://localhost:8089`
 
 ## API Endpoints
 
-### Create Email Job
+### Publish Email Job
 
 `POST /emails`
+
+Publishes a message to RabbitMQ.
 
 ```json
 {
   "email": "test@example.com",
   "subject": "Hello",
   "body": "Test email",
-  "scheduledTime": "2026-04-09T18:30:00"
+  "scheduledTime": "2026-04-11T18:30:00"
 }
 ```
 
-### Get All Jobs
+### Get Persisted Jobs
 
 `GET /emails`
 
-### Get Job By Id
+Returns jobs stored in PostgreSQL.
+
+### Get Persisted Job By Id
 
 `GET /emails/{id}`
 
-### Retry a Job
+Returns a single stored job from PostgreSQL.
+
+### Retry Stored Job
 
 `POST /emails/{id}/retry`
 
-Resets the job to `PENDING`, sets `retryCount` to `0`, and schedules it for immediate processing.
+Resets the stored record to `PENDING`, sets `retryCount` to `0`, and updates `scheduledTime` to now.
 
-## Status Model
+## Current Persistence Behavior
 
-- `PENDING` - waiting to be processed
-- `SENT` - sent successfully
-- `FAILED` - failed after 3 attempts
+This part is important because it is different from the older version:
 
-## Notes
+- `POST /emails` does not save a database row first
+- the main path publishes directly to RabbitMQ
+- failed messages are persisted by `EmailDLQConsumer`
+- successful sends are not currently stored in PostgreSQL
 
-- If `scheduledTime` is in the past, the service changes it to the current time.
-- The scheduler runs every 5 seconds using Spring `@Scheduled`.
-- `spring.jpa.hibernate.ddl-auto=update` is convenient for development but is usually replaced with migrations in production.
+So PostgreSQL is currently acting as a failure record store, not the primary queue.
+
+## Dead Letter Queue
+
+Why the dead-letter queue exists:
+
+- prevents failed messages from looping forever in the main queue
+- separates poison messages from normal traffic
+- gives you a place to inspect operational failures
+- allows later replay or manual recovery workflows
+
+In this project, a message reaches the DLQ when:
+
+1. `EmailConsumer` receives a message
+2. email sending throws an exception
+3. listener retries are exhausted
+4. RabbitMQ dead-letters the message
+5. `EmailDLQConsumer` consumes it from `email_dlq`
+6. the failed email is stored in the database with status `FAILED`
+
+## Important Notes
+
+- `scheduledTime` is part of the payload, but the consumer currently sends the email immediately when the message is consumed.
+- The `retry` endpoint currently updates the database record only. It does not republish that job back to RabbitMQ.
+- The project still contains the old polling scheduler class, but the current delivery model is RabbitMQ-driven.
+- `spring.jpa.hibernate.ddl-auto=update` is useful for development, but migrations are better for production.
 
 ## Safe GitHub Push Checklist
 
-- Do not commit real passwords in `application.properties`
-- Use environment variables for secrets
-- Keep local-only config files untracked
-- Rotate any secret that was previously committed, even if you delete it later
+- do not commit real credentials
+- keep `application-secrets.properties` untracked
+- review `application.properties` before push
+- rotate any credential that was committed in the past
 
 ## Future Improvements
 
-- Replace field injection with constructor injection
-- Add exception logging and failure reason storage
-- Add database migration tool such as Flyway
-- Add Swagger/OpenAPI documentation
-- Add tests for controller, service, and scheduler behavior
-
-
+- republish failed jobs to RabbitMQ from the retry endpoint
+- persist successful deliveries as well as failures
+- store error messages and retry metadata in the database
+- remove legacy polling code if it is no longer needed
+- move schema management to Flyway or Liquibase
+- switch field injection to constructor injection
